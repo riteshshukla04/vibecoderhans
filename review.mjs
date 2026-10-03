@@ -6,30 +6,83 @@ const {
   GITHUB_TOKEN,
   GITHUB_REPOSITORY,
   PR_NUMBER,
+  BOT_LOGIN,
   REVIEW_MODEL,
   REVIEW_INSTRUCTIONS,
   REVIEW_EXCLUDE,
   REVIEW_MAX_DIFF_CHARS,
+  REVIEW_ALLOW_REQUEST_CHANGES,
+  REVIEW_ALLOW_CLOSE,
 } = process.env
 const GITHUB_API_URL = process.env.GITHUB_API_URL ?? 'https://api.github.com'
 const MAX_DIFF_CHARS = Number(REVIEW_MAX_DIFF_CHARS) || 400_000
+const ALLOW_REQUEST_CHANGES = REVIEW_ALLOW_REQUEST_CHANGES !== 'false'
+const ALLOW_CLOSE = REVIEW_ALLOW_CLOSE === 'true'
 const LOCKFILES =
   /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|Podfile\.lock|Gemfile\.lock|Cargo\.lock|composer\.lock|go\.sum)$/
 const EXCLUDE = REVIEW_EXCLUDE ? new RegExp(REVIEW_EXCLUDE) : null
-const HEADER = '### VibeCoderHans review'
+const VERDICTS = ['comment', 'request_changes', 'close']
+const HEADERS = {
+  comment: '### VibeCoderHans review',
+  request_changes: '### VibeCoderHans review: changes requested',
+  close: '### VibeCoderHans review: closing this PR',
+}
 
-const SYSTEM_PROMPT = `You are VibeCoderHans, a code reviewer.
+const SYSTEM_PROMPT = `You are VibeCoderHans, a savage code reviewer. You are brutally honest, blunt and sarcastic. You never sugarcoat, you never pad a review with praise, and you call bad code exactly what it is. Good code gets a grudging nod at most.
 
-Review the pull request diff. Report real problems only: bugs, crashes, race conditions, security issues, resource leaks, breaking public API changes and missing error handling. Skip formatting and style nits that a linter would catch.
+Review the pull request. Hunt for real problems: bugs, crashes, race conditions, security holes, resource leaks, breaking public API changes and missing error handling. Don't waste anyone's time on formatting nits that a linter would catch.
 
-Reply with only a JSON object, with no prose and no code fences, in this shape:
-{"summary": string, "comments": [{"path": string, "line": number, "severity": "bug" | "risk" | "nit", "body": string}]}
+Pick a verdict:
+- "comment": the change is fine, or only has minor issues.
+- "request_changes": the change has problems that must be fixed before it can merge.
+- "close": the change makes no sense at all, such as spam, nonsense, deliberately broken code or changes unrelated to the project, and no amount of fixing would save it.
 
-"path" is the file path from the diff. "line" is a line number on the new side of the diff that falls inside a hunk. If the change looks good, say so in the summary and return an empty comments array.${
+When the verdict is "close", go fully savage: tear the change apart and make it painfully clear why it is being closed. Never use slurs or attack anyone's identity.
+
+Each line inside a diff hunk starts with its line number in the new file; removed lines have no number. Use that number for a comment's "line", and only comment on lines that have one.
+
+Submit the review by calling the submit_review tool once.${
   REVIEW_INSTRUCTIONS?.trim()
     ? `\n\nNotes from this repository's maintainers:\n${REVIEW_INSTRUCTIONS.trim()}`
     : ''
 }`
+
+const REVIEW_TOOL = {
+  name: 'submit_review',
+  description: 'Submit the review of the pull request. Call it exactly once.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      verdict: { type: 'string', enum: VERDICTS },
+      summary: {
+        type: 'string',
+        description: 'The overall review, in Markdown.',
+      },
+      comments: {
+        type: 'array',
+        description:
+          'Problems tied to specific lines. Empty if there are none.',
+        items: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'File path from the diff.' },
+            line: {
+              type: 'integer',
+              description: 'Line number in the new file, as shown in the diff.',
+            },
+            severity: { type: 'string', enum: ['bug', 'risk', 'nit'] },
+            body: {
+              type: 'string',
+              description: 'What is wrong and how to fix it.',
+            },
+          },
+          required: ['path', 'line', 'severity', 'body'],
+        },
+      },
+    },
+    required: ['verdict', 'summary', 'comments'],
+  },
+}
 
 if (!PR_NUMBER) {
   throw new Error(
@@ -48,21 +101,48 @@ const gh = (path, init = {}) =>
     },
   })
 
-function parseReview(text) {
-  try {
-    const review = JSON.parse(
-      text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1)
-    )
-    if (typeof review.summary !== 'string' || !Array.isArray(review.comments))
-      return null
-    review.comments = review.comments.filter(
+// Prefix each line inside a hunk with its line number in the new file, so the
+// model can point comments at the right line.
+function numberLines(section) {
+  let line = 0
+  return section
+    .split('\n')
+    .map(text => {
+      const hunk = text.match(/^@@ -\d+(?:,\d+)? \+(\d+)/)
+      if (hunk) {
+        line = Number(hunk[1])
+        return text
+      }
+      if (!line) return text
+      if (text.startsWith('-')) return `      ${text}`
+      if (text.startsWith('+') || text.startsWith(' '))
+        return `${String(line++).padStart(5)} ${text}`
+      return text
+    })
+    .join('\n')
+}
+
+function normalizeReview(review) {
+  if (typeof review?.summary !== 'string' || !Array.isArray(review.comments))
+    return null
+  return {
+    verdict: VERDICTS.includes(review.verdict) ? review.verdict : 'comment',
+    summary: review.summary.trim(),
+    comments: review.comments.filter(
       c =>
         typeof c?.path === 'string' &&
         Number.isInteger(c.line) &&
         c.line > 0 &&
         typeof c.body === 'string'
+    ),
+  }
+}
+
+function parseReview(text) {
+  try {
+    return normalizeReview(
+      JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1))
     )
-    return review
   } catch {
     return null
   }
@@ -82,7 +162,7 @@ if (!diffRes.ok) {
   console.log(`Could not fetch the diff (${diffRes.status}); skipping review.`)
   process.exit(0)
 }
-const diff = (await diffRes.text())
+const rawDiff = (await diffRes.text())
   .split(/^(?=diff --git )/m)
   .filter(section => {
     const path = section.match(/^diff --git a\/\S+ b\/(\S+)/)?.[1] ?? ''
@@ -90,16 +170,20 @@ const diff = (await diffRes.text())
   })
   .join('')
 
-if (!diff.trim()) {
+if (!rawDiff.trim()) {
   console.log('Only lockfiles or excluded files changed; skipping review.')
   process.exit(0)
 }
-if (diff.length > MAX_DIFF_CHARS) {
+if (rawDiff.length > MAX_DIFF_CHARS) {
   console.log(
-    `Diff is ${diff.length} characters, over the ${MAX_DIFF_CHARS} limit; skipping review.`
+    `Diff is ${rawDiff.length} characters, over the ${MAX_DIFF_CHARS} limit; skipping review.`
   )
   process.exit(0)
 }
+const diff = rawDiff
+  .split(/^(?=diff --git )/m)
+  .map(numberLines)
+  .join('')
 
 // 2. Ask the model for a review. The client reads ANTHROPIC_BASE_URL and
 // ANTHROPIC_AUTH_TOKEN from the environment.
@@ -108,6 +192,7 @@ const response = await client.messages.create({
   model: REVIEW_MODEL,
   max_tokens: 16000,
   system: SYSTEM_PROMPT,
+  tools: [REVIEW_TOOL],
   messages: [
     {
       role: 'user',
@@ -118,31 +203,37 @@ const response = await client.messages.create({
 if (response.stop_reason === 'max_tokens') {
   throw new Error('The review was cut off at max_tokens.')
 }
+const toolUse = response.content.find(
+  block => block.type === 'tool_use' && block.name === REVIEW_TOOL.name
+)
 const text = response.content
   .filter(block => block.type === 'text')
   .map(block => block.text)
   .join('')
-if (!text.trim()) throw new Error('The model returned no review text.')
+  .trim()
+// Fall back to JSON in the text, then to the text itself, for models that
+// answer without calling the tool.
+const review = toolUse ? normalizeReview(toolUse.input) : parseReview(text)
+if (!review && !text) throw new Error('The model returned no review.')
 
-// 3. Post it as a PR review with inline comments
+// 3. Post it as a PR review with inline comments, then act on the verdict
+let verdict = review?.verdict ?? 'comment'
+if (verdict === 'close' && !ALLOW_CLOSE) verdict = 'request_changes'
+if (verdict === 'request_changes' && !ALLOW_REQUEST_CHANGES) verdict = 'comment'
+const event = verdict === 'comment' ? 'COMMENT' : 'REQUEST_CHANGES'
+
 const post = payload =>
   gh(`/pulls/${PR_NUMBER}/reviews`, {
     method: 'POST',
-    body: JSON.stringify({
-      commit_id: pr.head.sha,
-      event: 'COMMENT',
-      ...payload,
-    }),
+    body: JSON.stringify({ commit_id: pr.head.sha, event, ...payload }),
   })
 
-const review = parseReview(text)
 let res
 if (!review) {
-  // The model ignored the JSON format; post what it wrote rather than nothing.
-  res = await post({ body: `${HEADER}\n\n${text}` })
+  res = await post({ body: `${HEADERS.comment}\n\n${text}` })
 } else {
   const label = c => `**${c.severity ?? 'note'}**`
-  const body = `${HEADER}\n\n${review.summary}`
+  const body = `${HEADERS[verdict]}\n\n${review.summary}`
   res = await post({
     body,
     comments: review.comments.map(c => ({
@@ -154,7 +245,7 @@ if (!review) {
   })
   // GitHub rejects the whole review (422) if any comment points outside the
   // diff. Fall back to listing the findings in the review body.
-  if (res.status === 422) {
+  if (res.status === 422 && review.comments.length) {
     const list = review.comments
       .map(c => `- \`${c.path}:${c.line}\` ${label(c)}: ${c.body}`)
       .join('\n')
@@ -164,4 +255,35 @@ if (!review) {
 if (!res.ok) {
   throw new Error(`GitHub API ${res.status}: ${await res.text()}`)
 }
-console.log(`Posted review on #${PR_NUMBER}.`)
+console.log(`Posted a ${verdict} review on #${PR_NUMBER}.`)
+
+if (verdict === 'close') {
+  const closeRes = await gh(`/pulls/${PR_NUMBER}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ state: 'closed' }),
+  })
+  if (!closeRes.ok) {
+    throw new Error(`GitHub API ${closeRes.status}: ${await closeRes.text()}`)
+  }
+  console.log(`Closed #${PR_NUMBER}.`)
+} else if (review?.verdict === 'comment' && BOT_LOGIN) {
+  // A clean review supersedes earlier change requests from this bot, which
+  // would otherwise keep blocking the PR.
+  const reviews = await (
+    await gh(`/pulls/${PR_NUMBER}/reviews?per_page=100`)
+  ).json()
+  for (const old of reviews) {
+    if (old.user?.login !== BOT_LOGIN || old.state !== 'CHANGES_REQUESTED')
+      continue
+    const dismissRes = await gh(
+      `/pulls/${PR_NUMBER}/reviews/${old.id}/dismissals`,
+      {
+        method: 'PUT',
+        body: JSON.stringify({
+          message: 'Superseded by a newer VibeCoderHans review.',
+        }),
+      }
+    )
+    console.log(`Dismissed review ${old.id}: ${dismissRes.status}`)
+  }
+}

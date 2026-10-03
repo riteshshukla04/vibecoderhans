@@ -29,6 +29,12 @@ inputs:
   max-diff-chars:
     description: Skip the review when the diff is longer than this many characters.
     default: '400000'
+  allow-request-changes:
+    description: Let the bot request changes, which blocks merging until it is dismissed or a later review comes back clean.
+    default: 'true'
+  allow-close:
+    description: Let the bot close pull requests that make no sense at all. When false, it requests changes instead.
+    default: 'false'
 
 runs:
   using: composite
@@ -55,5 +61,8 @@ runs:
         REVIEW_INSTRUCTIONS: ${{ inputs.instructions }}
         REVIEW_EXCLUDE: ${{ inputs.exclude }}
         REVIEW_MAX_DIFF_CHARS: ${{ inputs.max-diff-chars }}
+        REVIEW_ALLOW_REQUEST_CHANGES: ${{ inputs.allow-request-changes }}
+        REVIEW_ALLOW_CLOSE: ${{ inputs.allow-close }}
+        BOT_LOGIN: ${{ steps.app-token.outputs.app-slug }}[bot]
         GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
         PR_NUMBER: ${{ github.event.pull_request.number }}
