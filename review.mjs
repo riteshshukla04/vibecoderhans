@@ -186,8 +186,9 @@ const diff = rawDiff
   .join('')
 
 // 2. Ask the model for a review. The client reads ANTHROPIC_BASE_URL and
-// ANTHROPIC_AUTH_TOKEN from the environment.
-const client = new Anthropic()
+// ANTHROPIC_AUTH_TOKEN from the environment, and retries overloaded (429,
+// 5xx) responses with backoff.
+const client = new Anthropic({ maxRetries: 6 })
 const response = await client.messages.create({
   model: REVIEW_MODEL,
   max_tokens: 16000,
